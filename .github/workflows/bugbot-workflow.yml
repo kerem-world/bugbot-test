@@ -14,7 +14,7 @@ jobs:
       issues: write
 
     env:
-      # >>>>>>> CONFIGURABLE BOT ACCOUNT (change value or override at runtime) <<<<<<<
+      # >>>>>>> CONFIGURABLE BOT ACCOUNT (change here if you rename the bot) <<<<<<<
       BOT_ACCOUNT: codereviewkeremworld-bot
       # ---------------------------------------------------------------------------
       REPO: ${{ github.repository }}
@@ -23,15 +23,20 @@ jobs:
       PR_AUTHOR: ${{ github.event.pull_request.user.login }}
       HEAD_REF: ${{ github.event.pull_request.head.ref }}
       BASE_REF: ${{ github.event.pull_request.base.ref }}
-      CR_PAT: ${{ secrets.CR_PAT }}   # Fine-grained PAT created under the BOT_ACCOUNT
+      CR_PAT: ${{ secrets.CR_PAT }}                # Fine-grained PAT owned by BOT_ACCOUNT
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}    # Built-in token for repo writes
 
     steps:
-      - name: Verify CR_PAT secret present
+      - name: Verify CR_PAT present
         run: |
           if [ -z "${CR_PAT:-}" ]; then
             echo "::error::CR_PAT is empty. Add it under Settings > Secrets and variables > Actions."
             exit 1
           fi
+
+      - name: Ensure Actions can write (uses GH_TOKEN)
+        run: |
+          echo "This job requires Settings > Actions > General > Workflow permissions = Read and write."
 
       - name: Install jq (for debug)
         run: |
@@ -40,6 +45,7 @@ jobs:
 
       # ────────────────────────────────────────────────────────────────────────────
       # CASE A: PR is ALREADY authored by BOT_ACCOUNT → just trigger Bugbot.
+      # Use GITHUB_TOKEN to comment (avoids PAT scope issues).
       # ────────────────────────────────────────────────────────────────────────────
       - name: Trigger Bugbot when PR already by BOT_ACCOUNT
         if: env.PR_AUTHOR == env.BOT_ACCOUNT
@@ -47,7 +53,7 @@ jobs:
           echo "PR #${PR_NUMBER} already authored by ${BOT_ACCOUNT}. Posting 'bugbot run'."
           http=$(curl -sS -o /tmp/comment.json -w "%{http_code}" \
             -X POST \
-            -H "Authorization: token ${CR_PAT}" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments" \
             -d '{"body":"bugbot run"}')
@@ -59,8 +65,8 @@ jobs:
           fi
 
       # ────────────────────────────────────────────────────────────────────────────
-      # CASE B: PR authored by someone else → close original, recreate under BOT_ACCOUNT,
-      # then trigger Bugbot on the new PR.
+      # CASE B: PR authored by someone else → close original with GITHUB_TOKEN,
+      # recreate under BOT_ACCOUNT using CR_PAT, then comment with GITHUB_TOKEN.
       # ────────────────────────────────────────────────────────────────────────────
       - name: Debug - list existing PRs for head branch
         if: env.PR_AUTHOR != env.BOT_ACCOUNT
@@ -75,8 +81,6 @@ jobs:
 
       - name: Close original PR (GITHUB_TOKEN)
         if: env.PR_AUTHOR != env.BOT_ACCOUNT
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "Closing original PR #${PR_NUMBER} by ${PR_AUTHOR}"
           http=$(curl -sS -o /tmp/close.json -w "%{http_code}" \
@@ -92,7 +96,7 @@ jobs:
             exit 1
           fi
 
-      - name: Create new PR as BOT_ACCOUNT (draft)
+      - name: Create new PR as BOT_ACCOUNT (draft) via CR_PAT
         if: env.PR_AUTHOR != env.BOT_ACCOUNT
         run: |
           echo "Creating new PR as ${BOT_ACCOUNT}: head=${HEAD_REF} -> base=${BASE_REF}"
@@ -116,13 +120,13 @@ jobs:
           echo "NEW_PR=$NEW_PR" >> $GITHUB_ENV
           echo "Created PR #$NEW_PR"
 
-      - name: Trigger Bugbot on new PR
+      - name: Trigger Bugbot on new PR (GITHUB_TOKEN)
         if: env.PR_AUTHOR != env.BOT_ACCOUNT
         run: |
           echo "Commenting 'bugbot run' on PR #${NEW_PR}"
           http=$(curl -sS -o /tmp/comment.json -w "%{http_code}" \
             -X POST \
-            -H "Authorization: token ${CR_PAT}" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/issues/${NEW_PR}/comments" \
             -d '{"body":"bugbot run"}')
@@ -132,3 +136,4 @@ jobs:
             echo "::error::Failed to add comment to PR ${NEW_PR} (HTTP $http)."
             exit 1
           fi
+
