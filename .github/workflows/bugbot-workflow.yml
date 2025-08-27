@@ -1,8 +1,8 @@
-name: Route PRs to bot only for codereview/* and trigger Bugbot
+name: Route PRs to bot only for codereview/* (same-repo) and trigger Bugbot
 
 on:
-  # We use pull_request_target so secrets are available even from forks.
-  # This workflow does NOT checkout or run PR code; it only calls the GitHub API.
+  # We use pull_request_target so secrets are available.
+  # This workflow never checks out or runs PR code; it only calls GitHub API.
   pull_request_target:
     types: [opened]
 
@@ -16,36 +16,46 @@ jobs:
 
     env:
       # -------- CONFIG --------
-      BOT_ACCOUNT: codereviewkeremworld-bot        # change here if you rename the bot
-      CREATE_AS_DRAFT: "false"                     # "true" or "false"
+      BOT_ACCOUNT: codereviewkeremworld-bot     # change if you rename the bot
+      CREATE_AS_DRAFT: "false"                  # "true" or "false"
       # ------------------------
-      REPO: ${{ github.repository }}
-      OWNER: ${{ github.repository_owner }}
+      REPO: ${{ github.repository }}            # e.g., kerem-world/bugbot-test
+      OWNER: ${{ github.repository_owner }}     # e.g., kerem-world
       PR_NUMBER: ${{ github.event.pull_request.number }}
       PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+      PR_TITLE: ${{ github.event.pull_request.title }}
+      PR_BODY: ${{ github.event.pull_request.body }}
       HEAD_REF: ${{ github.event.pull_request.head.ref }}
       BASE_REF: ${{ github.event.pull_request.base.ref }}
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}    # built-in token, needs repo Actions perms = Read & write
-      CR_PAT: ${{ secrets.CR_PAT }}                # fine-grained PAT from BOT_ACCOUNT
+      HEAD_REPO_FULL: ${{ github.event.pull_request.head.repo.full_name }}
+      BASE_REPO_FULL: ${{ github.event.pull_request.base.repo.full_name }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # needs repo Actions perms: Read & write
+      CR_PAT: ${{ secrets.CR_PAT }}              # fine-grained PAT owned by BOT_ACCOUNT
 
     steps:
       - name: Sanity checks
         run: |
-          echo "PR #${PR_NUMBER} by ${PR_AUTHOR}, head=${HEAD_REF}, base=${BASE_REF}"
+          set -euo pipefail
+          echo "PR #${PR_NUMBER} by ${PR_AUTHOR}"
+          echo "  base: ${BASE_REPO_FULL}:${BASE_REF}"
+          echo "  head: ${HEAD_REPO_FULL}:${HEAD_REF}"
           if [ -z "${CR_PAT:-}" ]; then
             echo "::error::CR_PAT is empty. Add it under Settings > Secrets and variables > Actions."
             exit 1
           fi
+          echo "This job requires: Settings > Actions > General > Workflow permissions = Read and write."
 
       - name: Install jq
         run: |
+          set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y jq
 
-      # A) If PR already by the bot → just trigger Bugbot and exit.
+      # A) If PR is already authored by the bot → just trigger Bugbot, then exit.
       - name: Trigger Bugbot when PR already by BOT_ACCOUNT
         if: env.PR_AUTHOR == env.BOT_ACCOUNT
         run: |
+          set -euo pipefail
           echo "PR already by ${BOT_ACCOUNT}. Posting 'bugbot run'."
           http=$(curl -sS -o /tmp/comment.json -w "%{http_code}" \
             -X POST \
@@ -60,43 +70,66 @@ jobs:
             exit 1
           fi
 
-      # B) Decide whether to reauthor (only for codereview/* branches).
-      - name: Decide whether to route to bot (branch prefix check)
+      # B) Decide whether to reauthor (branch must be codereview/* and SAME REPO).
+      - name: Decide whether to route to bot
         if: env.PR_AUTHOR != env.BOT_ACCOUNT
         id: decide
         run: |
-          if [[ "${HEAD_REF}" == codereview/* ]]; then
-            echo "route=true" >> $GITHUB_OUTPUT
-            echo "Will reauthor under ${BOT_ACCOUNT}"
-          else
-            echo "route=false" >> $GITHUB_OUTPUT
-            echo "Not a codereview/* branch. Leaving PR as-is."
+          set -euo pipefail
+          route=true
+          if [[ "${HEAD_REF}" != codereview/* ]]; then
+            echo "Not a codereview/* branch → will NOT reauthor."
+            route=false
           fi
+          if [ "${HEAD_REPO_FULL}" != "${BASE_REPO_FULL}" ]; then
+            echo "Head repo (${HEAD_REPO_FULL}) != base repo (${BASE_REPO_FULL}) → fork detected → will NOT reauthor."
+            route=false
+          fi
+          echo "route=${route}" >> $GITHUB_OUTPUT
 
-      - name: Skip — not a codereview/* branch (leave PR open)
+      - name: Skip — leave PR as-is (not codereview/* or is a fork)
         if: env.PR_AUTHOR != env.BOT_ACCOUNT && steps.decide.outputs.route == 'false'
-        run: echo "Skipping reauthoring; engineers keep this PR."
+        run: |
+          set -euo pipefail
+          echo "Leaving PR open for normal engineer review."
+          echo "To use the bot seat, push branch to the base repo under 'codereview/*'."
 
-      # C) For codereview/* PRs by someone else: create new PR as bot FIRST, then close original.
-      - name: Create bot-authored PR (first) via CR_PAT
+      # C) Reauthor only when codereview/* AND same-repo:
+      #    Create bot-authored PR FIRST (copy title/body), then close original.
+      - name: Create bot-authored PR (first) via CR_PAT (copies title/body)
         if: env.PR_AUTHOR != env.BOT_ACCOUNT && steps.decide.outputs.route == 'true'
         id: create_bot_pr
         run: |
-          echo "Creating new PR as ${BOT_ACCOUNT}: head=${HEAD_REF} -> base=${BASE_REF}"
+          set -euo pipefail
+          echo "Creating new PR as ${BOT_ACCOUNT}: head=${OWNER}:${HEAD_REF} -> base=${BASE_REF}"
+
           # Convert CREATE_AS_DRAFT ("true"/"false") to JSON boolean
-          draft_json=$( [ "${CREATE_AS_DRAFT}" = "true" ] && echo "true" || echo "false" )
+          draft_json=$( [ "${CREATE_AS_DRAFT}" = "true" ] && echo true || echo false )
+
+          # Build JSON safely with jq to avoid quoting issues
+          jq -n \
+            --arg title "${PR_TITLE}" \
+            --arg body "${PR_BODY:-Auto-opened by ${BOT_ACCOUNT}}" \
+            --arg head "${OWNER}:${HEAD_REF}" \
+            --arg base "${BASE_REF}" \
+            --argjson draft "${draft_json}" \
+            '{title:$title, body:$body, head:$head, base:$base, draft:$draft}' > /tmp/create_pr_payload.json
+
+          echo "Payload:"; cat /tmp/create_pr_payload.json
+
           http=$(curl -sS -o /tmp/create_pr.json -w "%{http_code}" \
             -X POST \
             -H "Authorization: token ${CR_PAT}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/pulls" \
-            -d "{\"title\":\"Recreated PR\",\"body\":\"Auto-opened by ${BOT_ACCOUNT}\",\"head\":\"${HEAD_REF}\",\"base\":\"${BASE_REF}\",\"draft\":${draft_json}}")
+            --data-binary @/tmp/create_pr_payload.json)
           echo "HTTP_STATUS=$http"
           echo "RESPONSE:"; cat /tmp/create_pr.json
           if [ "$http" -lt 200 ] || [ "$http" -ge 300 ]; then
             echo "::error::PR create failed (HTTP $http). Original PR will NOT be closed."
             exit 1
           fi
+
           NEW_PR=$(jq -r '.number' /tmp/create_pr.json)
           if [ -z "$NEW_PR" ] || [ "$NEW_PR" = "null" ]; then
             echo "::error::No PR number in response. Original PR will NOT be closed."
@@ -108,6 +141,7 @@ jobs:
       - name: Trigger Bugbot on new PR (GITHUB_TOKEN)
         if: env.PR_AUTHOR != env.BOT_ACCOUNT && steps.decide.outputs.route == 'true'
         run: |
+          set -euo pipefail
           echo "Commenting 'bugbot run' on PR #${NEW_PR}"
           http=$(curl -sS -o /tmp/comment.json -w "%{http_code}" \
             -X POST \
@@ -125,6 +159,7 @@ jobs:
       - name: Close original PR (only after bot PR exists)
         if: env.PR_AUTHOR != env.BOT_ACCOUNT && steps.decide.outputs.route == 'true'
         run: |
+          set -euo pipefail
           echo "Closing original PR #${PR_NUMBER} by ${PR_AUTHOR}"
           http=$(curl -sS -o /tmp/close.json -w "%{http_code}" \
             -X PATCH \
