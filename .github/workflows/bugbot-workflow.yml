@@ -10,36 +10,48 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
+    env:
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+      CR_PAT: ${{ secrets.CR_PAT }}   # fine-grained PAT for codereview-feraset
     steps:
-      - name: Install GitHub CLI
-        uses: cli/cli-action@v2
+      - name: Exit if already authored by codereview-feraset
+        if: env.PR_AUTHOR == 'codereview-feraset'
+        run: echo "Already authored by codereview-feraset."
 
-      - name: Reopen PR as codereview-feraset
-        env:
-          GH_TOKEN: ${{ secrets.CR_PAT }}   # PAT from codereview-feraset
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
+      # Close original PR (use issues endpoint to change state)
+      - name: Close original PR
+        if: env.PR_AUTHOR != 'codereview-feraset'
         run: |
-          if [ "$PR_AUTHOR" = "codereview-feraset" ]; then
-            echo "Already authored by codereview-feraset."
-            exit 0
-          fi
+          curl -sS -X PATCH \
+            -H "Authorization: token ${CR_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}" \
+            -d '{"state":"closed", "state_reason":"completed"}'
 
-          # Close the original PR
-          gh pr close "$PR_NUMBER" --repo "$REPO" --comment "Reopening under @codereview-feraset"
+      # Recreate PR as codereview-feraset
+      - name: Create new PR as codereview-feraset (draft)
+        if: env.PR_AUTHOR != 'codereview-feraset'
+        id: create_pr
+        run: |
+          resp=$(curl -sS -X POST \
+            -H "Authorization: token ${CR_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/pulls" \
+            -d "{\"title\":\"Recreated PR\",\"body\":\"Auto-opened by codereview-feraset\",\"head\":\"${HEAD_REF}\",\"base\":\"${BASE_REF}\",\"draft\":true}")
+          echo "$resp" | grep -Eo '"number":[0-9]+' | head -n1 | grep -Eo '[0-9]+' > new_pr_number.txt
+          echo "NEW_PR=$(cat new_pr_number.txt)" >> $GITHUB_ENV
 
-          # Recreate PR under codereview-feraset
-          gh pr create \
-            --repo "$REPO" \
-            --base "$BASE_REF" \
-            --head "$HEAD_REF" \
-            --title "Recreated PR" \
-            --body "Auto-opened by codereview-feraset" \
-            --draft
+      # Trigger Bugbot on the new PR
+      - name: Comment bugbot run
+        if: env.PR_AUTHOR != 'codereview-feraset'
+        run: |
+          curl -sS -X POST \
+            -H "Authorization: token ${CR_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/issues/${NEW_PR}/comments" \
+            -d '{"body":"bugbot run"}'
 
-          # Grab new PR number and trigger Bugbot
-          NEW_PR=$(gh pr list --repo "$REPO" --head "$HEAD_REF" --state open --json number -q '.[0].number')
-          gh pr comment "$NEW_PR" --repo "$REPO" --body "bugbot run"
