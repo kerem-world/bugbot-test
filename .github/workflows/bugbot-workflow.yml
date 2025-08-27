@@ -1,8 +1,7 @@
 name: Route PRs to bot only for codereview/* (same-repo) and trigger Bugbot
 
 on:
-  # We use pull_request_target so secrets are available.
-  # This workflow never checks out or runs PR code; it only calls GitHub API.
+  # Secrets available; we never check out or run PR code.
   pull_request_target:
     types: [opened]
 
@@ -29,7 +28,7 @@ jobs:
       BASE_REF: ${{ github.event.pull_request.base.ref }}
       HEAD_REPO_FULL: ${{ github.event.pull_request.head.repo.full_name }}
       BASE_REPO_FULL: ${{ github.event.pull_request.base.repo.full_name }}
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # needs repo Actions perms: Read & write
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # requires repo → Actions → Workflow permissions = Read & write
       CR_PAT: ${{ secrets.CR_PAT }}              # fine-grained PAT owned by BOT_ACCOUNT
 
     steps:
@@ -95,15 +94,34 @@ jobs:
           echo "To use the bot seat, push branch to the base repo under 'codereview/*'."
 
       # C) Reauthor only when codereview/* AND same-repo:
-      #    Create bot-authored PR FIRST (copy title/body), then close original.
-      - name: Create bot-authored PR (first) via CR_PAT (copies title/body)
+      #    Close original PR FIRST (to avoid 422 'already exists'), then create bot-authored PR.
+      - name: Close original PR first (avoid 422)
+        if: env.PR_AUTHOR != env.BOT_ACCOUNT && steps.decide.outputs.route == 'true'
+        id: close_original
+        run: |
+          set -euo pipefail
+          echo "Closing original PR #${PR_NUMBER} by ${PR_AUTHOR} before creating bot PR"
+          http=$(curl -sS -o /tmp/close.json -w "%{http_code}" \
+            -X PATCH \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}" \
+            -d '{"state":"closed","state_reason":"completed"}')
+          echo "HTTP_STATUS=$http"
+          echo "RESPONSE:"; cat /tmp/close.json
+          if [ "$http" -lt 200 ] || [ "$http" -ge 300 ]; then
+            echo "::error::Failed to close original PR ${PR_NUMBER} (HTTP $http)."
+            exit 1
+          fi
+          echo "original_closed=true" >> $GITHUB_OUTPUT
+
+      - name: Create bot-authored PR (copies title/body)
         if: env.PR_AUTHOR != env.BOT_ACCOUNT && steps.decide.outputs.route == 'true'
         id: create_bot_pr
         run: |
           set -euo pipefail
           echo "Creating new PR as ${BOT_ACCOUNT}: head=${OWNER}:${HEAD_REF} -> base=${BASE_REF}"
 
-          # Convert CREATE_AS_DRAFT ("true"/"false") to JSON boolean
           draft_json=$( [ "${CREATE_AS_DRAFT}" = "true" ] && echo true || echo false )
 
           # Build JSON safely with jq to avoid quoting issues
@@ -125,20 +143,39 @@ jobs:
             --data-binary @/tmp/create_pr_payload.json)
           echo "HTTP_STATUS=$http"
           echo "RESPONSE:"; cat /tmp/create_pr.json
+
           if [ "$http" -lt 200 ] || [ "$http" -ge 300 ]; then
-            echo "::error::PR create failed (HTTP $http). Original PR will NOT be closed."
+            echo "::warning::PR create failed (HTTP $http). Attempting to reopen original PR…"
+            rehttp=$(curl -sS -o /tmp/reopen.json -w "%{http_code}" \
+              -X PATCH \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}" \
+              -d '{"state":"open"}')
+            echo "REOPEN_HTTP_STATUS=$rehttp"
+            echo "REOPEN_RESPONSE:"; cat /tmp/reopen.json
+            echo "::error::Failed to create bot PR; original PR has been reopened."
             exit 1
           fi
 
           NEW_PR=$(jq -r '.number' /tmp/create_pr.json)
           if [ -z "$NEW_PR" ] || [ "$NEW_PR" = "null" ]; then
-            echo "::error::No PR number in response. Original PR will NOT be closed."
+            echo "::warning::No PR number in response. Attempting to reopen original PR…"
+            rehttp=$(curl -sS -o /tmp/reopen.json -w "%{http_code}" \
+              -X PATCH \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}" \
+              -d '{"state":"open"}')
+            echo "REOPEN_HTTP_STATUS=$rehttp"
+            echo "REOPEN_RESPONSE:"; cat /tmp/reopen.json
+            echo "::error::Failed to create bot PR; original PR has been reopened."
             exit 1
           fi
           echo "NEW_PR=$NEW_PR" >> $GITHUB_ENV
           echo "Created PR #$NEW_PR as ${BOT_ACCOUNT}"
 
-      - name: Trigger Bugbot on new PR (GITHUB_TOKEN)
+      - name: Trigger Bugbot on new PR
         if: env.PR_AUTHOR != env.BOT_ACCOUNT && steps.decide.outputs.route == 'true'
         run: |
           set -euo pipefail
@@ -153,23 +190,5 @@ jobs:
           echo "RESPONSE:"; cat /tmp/comment.json
           if [ "$http" -lt 200 ] || [ "$http" -ge 300 ]; then
             echo "::error::Failed to add comment to PR ${NEW_PR} (HTTP $http)."
-            exit 1
-          fi
-
-      - name: Close original PR (only after bot PR exists)
-        if: env.PR_AUTHOR != env.BOT_ACCOUNT && steps.decide.outputs.route == 'true'
-        run: |
-          set -euo pipefail
-          echo "Closing original PR #${PR_NUMBER} by ${PR_AUTHOR}"
-          http=$(curl -sS -o /tmp/close.json -w "%{http_code}" \
-            -X PATCH \
-            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}" \
-            -d '{"state":"closed","state_reason":"completed"}')
-          echo "HTTP_STATUS=$http"
-          echo "RESPONSE:"; cat /tmp/close.json
-          if [ "$http" -lt 200 ] || [ "$http" -ge 300 ]; then
-            echo "::error::Failed to close original PR ${PR_NUMBER} (HTTP $http)."
             exit 1
           fi
