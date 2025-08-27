@@ -2,8 +2,9 @@ name: Auto open PR as codereview-feraset
 
 on:
   create:
-    branches:
-      - 'codereview/**'   # devs push to codereview/*
+    branches: ['codereview/**']
+  push:
+    branches:  ['codereview/**']   # catches updates to existing codereview/* branches
 
 concurrency:
   group: auto-open-pr-${{ github.ref }}
@@ -18,16 +19,31 @@ jobs:
       pull-requests: write
       issues: write
     steps:
-      - name: Install GitHub CLI + jq
+      - name: Install GitHub CLI
+        uses: cli/cli-action@v2
+
+      - name: Install jq
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq
+
+      - name: Check GH_TOKEN is set (debug)
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "GH_TOKEN is not set"; exit 1
+          else
+            echo "GH_TOKEN present"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.CR_PAT }}
+
       - name: Determine default branch
         env:
           GH_TOKEN: ${{ secrets.CR_PAT }}
         run: |
           DEF=$(gh repo view "${GITHUB_REPOSITORY}" --json defaultBranchRef -q '.defaultBranchRef.name')
           echo "DEFAULT_BRANCH=$DEF" >> $GITHUB_ENV
+
       - name: Create PR and trigger Bugbot
         env:
           GH_TOKEN: ${{ secrets.CR_PAT }}
@@ -39,10 +55,8 @@ jobs:
             exit 0
           fi
 
-          # Optional: derive a nicer title from branch name
           TITLE="PR: ${BRANCH_NAME#codereview/}"
 
-          # Create as draft to avoid premature CI/noise; remove --draft if you prefer
           gh pr create \
             --title "$TITLE" \
             --body "Auto-opened by codereview-feraset" \
@@ -50,8 +64,6 @@ jobs:
             --head "$BRANCH_NAME" \
             --draft
 
-          # Grab PR number
           PR_NUMBER=$(gh pr list --head "$BRANCH_NAME" --state open --json number -q '.[0].number')
 
-          # Trigger Bugbot
           gh pr comment "$PR_NUMBER" --body "bugbot run"
