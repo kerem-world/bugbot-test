@@ -1,16 +1,13 @@
 name: Reopen PRs under codereview-feraset
 
 on:
-  # Use pull_request_target so repo/org secrets are available even for PRs from forks.
-  # This workflow does NOT check out or run untrusted PR code; it only calls the GitHub API.
+  # Secrets needed; this workflow does NOT check out PR code.
   pull_request_target:
     types: [opened]
 
 jobs:
   reauthor:
     runs-on: ubuntu-latest
-
-    # Needed to close/create PRs and add a comment
     permissions:
       contents: read
       pull-requests: write
@@ -18,11 +15,12 @@ jobs:
 
     env:
       REPO: ${{ github.repository }}
+      OWNER: ${{ github.repository_owner }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
       PR_AUTHOR: ${{ github.event.pull_request.user.login }}
       HEAD_REF: ${{ github.event.pull_request.head.ref }}
       BASE_REF: ${{ github.event.pull_request.base.ref }}
-      CR_PAT: ${{ secrets.CR_PAT }}   # Fine-grained PAT for codereview-feraset
+      CR_PAT: ${{ secrets.CR_PAT }}   # Fine-grained PAT from codereview-feraset
 
     steps:
       - name: Verify secret present
@@ -36,7 +34,7 @@ jobs:
         if: env.PR_AUTHOR == 'codereview-feraset'
         run: echo "Already authored by codereview-feraset. Nothing to do."
 
-      - name: Install jq (for debug output)
+      - name: Install jq (for debug)
         if: env.PR_AUTHOR != 'codereview-feraset'
         run: |
           sudo apt-get update -y
@@ -45,12 +43,13 @@ jobs:
       - name: Debug - list existing PRs for head branch
         if: env.PR_AUTHOR != 'codereview-feraset'
         run: |
-          echo "Checking existing PRs for head=${HEAD_REF}"
-          curl -sS \
+          echo "Checking existing PRs for head=${OWNER}:${HEAD_REF}"
+          resp=$(curl -sS \
             -H "Authorization: token ${CR_PAT}" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/pulls?head=${HEAD_REF}&state=all" \
-            | jq '.[] | {number, state, head:.head.ref, base:.base.ref}'
+            "https://api.github.com/repos/${REPO}/pulls?state=all&head=${OWNER}:${HEAD_REF}")
+          echo "RAW RESPONSE:"; echo "$resp"
+          echo "$resp" | jq 'if type=="array" then .[] | {number, state, head:.head.ref, base:.base.ref} else . end' || true
 
       - name: Close original PR
         if: env.PR_AUTHOR != 'codereview-feraset'
