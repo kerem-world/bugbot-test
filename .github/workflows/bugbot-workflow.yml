@@ -1,7 +1,7 @@
-name: Reopen PRs under codereview-feraset
+name: Reopen PRs under bot account and trigger Bugbot
 
 on:
-  # Secrets needed; this workflow does NOT check out PR code.
+  # Secrets needed; we do NOT checkout or run PR code, so this is safe.
   pull_request_target:
     types: [opened]
 
@@ -14,34 +14,56 @@ jobs:
       issues: write
 
     env:
+      # >>>>>>> CONFIGURABLE BOT ACCOUNT (change value or override at runtime) <<<<<<<
+      BOT_ACCOUNT: codereviewkeremworld-bot
+      # ---------------------------------------------------------------------------
       REPO: ${{ github.repository }}
       OWNER: ${{ github.repository_owner }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
       PR_AUTHOR: ${{ github.event.pull_request.user.login }}
       HEAD_REF: ${{ github.event.pull_request.head.ref }}
       BASE_REF: ${{ github.event.pull_request.base.ref }}
-      CR_PAT: ${{ secrets.CR_PAT }}   # Fine-grained PAT from codereview-feraset
+      CR_PAT: ${{ secrets.CR_PAT }}   # Fine-grained PAT created under the BOT_ACCOUNT
 
     steps:
-      - name: Verify secret present
+      - name: Verify CR_PAT secret present
         run: |
           if [ -z "${CR_PAT:-}" ]; then
             echo "::error::CR_PAT is empty. Add it under Settings > Secrets and variables > Actions."
             exit 1
           fi
 
-      - name: Exit if already authored by codereview-feraset
-        if: env.PR_AUTHOR == 'codereview-feraset'
-        run: echo "Already authored by codereview-feraset. Nothing to do."
-
       - name: Install jq (for debug)
-        if: env.PR_AUTHOR != 'codereview-feraset'
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq
 
+      # ────────────────────────────────────────────────────────────────────────────
+      # CASE A: PR is ALREADY authored by BOT_ACCOUNT → just trigger Bugbot.
+      # ────────────────────────────────────────────────────────────────────────────
+      - name: Trigger Bugbot when PR already by BOT_ACCOUNT
+        if: env.PR_AUTHOR == env.BOT_ACCOUNT
+        run: |
+          echo "PR #${PR_NUMBER} already authored by ${BOT_ACCOUNT}. Posting 'bugbot run'."
+          http=$(curl -sS -o /tmp/comment.json -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: token ${CR_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            -d '{"body":"bugbot run"}')
+          echo "HTTP_STATUS=$http"
+          echo "RESPONSE:"; cat /tmp/comment.json
+          if [ "$http" -lt 200 ] || [ "$http" -ge 300 ]; then
+            echo "::error::Failed to add comment to PR ${PR_NUMBER} (HTTP $http)."
+            exit 1
+          fi
+
+      # ────────────────────────────────────────────────────────────────────────────
+      # CASE B: PR authored by someone else → close original, recreate under BOT_ACCOUNT,
+      # then trigger Bugbot on the new PR.
+      # ────────────────────────────────────────────────────────────────────────────
       - name: Debug - list existing PRs for head branch
-        if: env.PR_AUTHOR != 'codereview-feraset'
+        if: env.PR_AUTHOR != env.BOT_ACCOUNT
         run: |
           echo "Checking existing PRs for head=${OWNER}:${HEAD_REF}"
           resp=$(curl -sS \
@@ -51,13 +73,15 @@ jobs:
           echo "RAW RESPONSE:"; echo "$resp"
           echo "$resp" | jq 'if type=="array" then .[] | {number, state, head:.head.ref, base:.base.ref} else . end' || true
 
-      - name: Close original PR
-        if: env.PR_AUTHOR != 'codereview-feraset'
+      - name: Close original PR (GITHUB_TOKEN)
+        if: env.PR_AUTHOR != env.BOT_ACCOUNT
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "Closing original PR #${PR_NUMBER} by ${PR_AUTHOR}"
           http=$(curl -sS -o /tmp/close.json -w "%{http_code}" \
             -X PATCH \
-            -H "Authorization: token ${CR_PAT}" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}" \
             -d '{"state":"closed","state_reason":"completed"}')
@@ -68,23 +92,22 @@ jobs:
             exit 1
           fi
 
-      - name: Create new PR as codereview-feraset (draft)
-        if: env.PR_AUTHOR != 'codereview-feraset'
+      - name: Create new PR as BOT_ACCOUNT (draft)
+        if: env.PR_AUTHOR != env.BOT_ACCOUNT
         run: |
-          echo "Creating new PR: head=${HEAD_REF} -> base=${BASE_REF}"
+          echo "Creating new PR as ${BOT_ACCOUNT}: head=${HEAD_REF} -> base=${BASE_REF}"
           http=$(curl -sS -o /tmp/create_pr.json -w "%{http_code}" \
             -X POST \
             -H "Authorization: token ${CR_PAT}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/pulls" \
-            -d "{\"title\":\"Recreated PR\",\"body\":\"Auto-opened by codereview-feraset\",\"head\":\"${HEAD_REF}\",\"base\":\"${BASE_REF}\",\"draft\":true}")
+            -d "{\"title\":\"Recreated PR\",\"body\":\"Auto-opened by ${BOT_ACCOUNT}\",\"head\":\"${HEAD_REF}\",\"base\":\"${BASE_REF}\",\"draft\":true}")
           echo "HTTP_STATUS=$http"
           echo "RESPONSE:"; cat /tmp/create_pr.json
           if [ "$http" -lt 200 ] || [ "$http" -ge 300 ]; then
             echo "::error::PR create failed (HTTP $http). See response above."
             exit 1
           fi
-
           NEW_PR=$(jq -r '.number' /tmp/create_pr.json)
           if [ -z "$NEW_PR" ] || [ "$NEW_PR" = "null" ]; then
             echo "::error::No PR number in response. See response above."
@@ -93,8 +116,8 @@ jobs:
           echo "NEW_PR=$NEW_PR" >> $GITHUB_ENV
           echo "Created PR #$NEW_PR"
 
-      - name: Trigger Bugbot
-        if: env.PR_AUTHOR != 'codereview-feraset'
+      - name: Trigger Bugbot on new PR
+        if: env.PR_AUTHOR != env.BOT_ACCOUNT
         run: |
           echo "Commenting 'bugbot run' on PR #${NEW_PR}"
           http=$(curl -sS -o /tmp/comment.json -w "%{http_code}" \
@@ -109,4 +132,3 @@ jobs:
             echo "::error::Failed to add comment to PR ${NEW_PR} (HTTP $http)."
             exit 1
           fi
-
