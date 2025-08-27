@@ -1,12 +1,13 @@
-name: Reopen PRs under bot account and trigger Bugbot
+name: Reopen PRs under bot account only for codereview/* branches
 
 on:
-  # Secrets needed; we do NOT checkout or run PR code, so this is safe.
+  # We use pull_request_target so secrets are available.
+  # This workflow never checks out or runs PR code; it only calls GitHub API.
   pull_request_target:
     types: [opened]
 
 jobs:
-  reauthor:
+  route_or_trigger:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -14,43 +15,39 @@ jobs:
       issues: write
 
     env:
-      # >>>>>>> CONFIGURABLE BOT ACCOUNT (change here if you rename the bot) <<<<<<<
+      # >>>>>>> CONFIGURABLE BOT ACCOUNT <<<<<<<
       BOT_ACCOUNT: codereviewkeremworld-bot
-      # ---------------------------------------------------------------------------
+      # ---------------------------------------
       REPO: ${{ github.repository }}
       OWNER: ${{ github.repository_owner }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
       PR_AUTHOR: ${{ github.event.pull_request.user.login }}
       HEAD_REF: ${{ github.event.pull_request.head.ref }}
       BASE_REF: ${{ github.event.pull_request.base.ref }}
-      CR_PAT: ${{ secrets.CR_PAT }}                # Fine-grained PAT owned by BOT_ACCOUNT
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}    # Built-in token for repo writes
+      CR_PAT: ${{ secrets.CR_PAT }}                  # Fine-grained PAT owned by BOT_ACCOUNT
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}      # Built-in token for repo writes
 
     steps:
-      - name: Verify CR_PAT present
+      - name: Sanity checks
         run: |
+          echo "PR #${PR_NUMBER} by ${PR_AUTHOR}, head=${HEAD_REF}, base=${BASE_REF}"
           if [ -z "${CR_PAT:-}" ]; then
             echo "::error::CR_PAT is empty. Add it under Settings > Secrets and variables > Actions."
             exit 1
           fi
 
-      - name: Ensure Actions can write (uses GH_TOKEN)
-        run: |
-          echo "This job requires Settings > Actions > General > Workflow permissions = Read and write."
-
-      - name: Install jq (for debug)
+      - name: Install jq
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq
 
       # ────────────────────────────────────────────────────────────────────────────
-      # CASE A: PR is ALREADY authored by BOT_ACCOUNT → just trigger Bugbot.
-      # Use GITHUB_TOKEN to comment (avoids PAT scope issues).
+      # A) If PR is ALREADY authored by the bot → just trigger Bugbot and exit.
       # ────────────────────────────────────────────────────────────────────────────
       - name: Trigger Bugbot when PR already by BOT_ACCOUNT
         if: env.PR_AUTHOR == env.BOT_ACCOUNT
         run: |
-          echo "PR #${PR_NUMBER} already authored by ${BOT_ACCOUNT}. Posting 'bugbot run'."
+          echo "PR already by ${BOT_ACCOUNT}. Posting 'bugbot run'."
           http=$(curl -sS -o /tmp/comment.json -w "%{http_code}" \
             -X POST \
             -H "Authorization: Bearer ${GITHUB_TOKEN}" \
@@ -65,11 +62,28 @@ jobs:
           fi
 
       # ────────────────────────────────────────────────────────────────────────────
-      # CASE B: PR authored by someone else → close original with GITHUB_TOKEN,
-      # recreate under BOT_ACCOUNT using CR_PAT, then comment with GITHUB_TOKEN.
+      # B) If PR head branch starts with codereview/* → reauthor under BOT_ACCOUNT.
+      #    Otherwise, skip without touching the PR (no auto-close).
       # ────────────────────────────────────────────────────────────────────────────
-      - name: Debug - list existing PRs for head branch
+      - name: Decide whether to route to bot (branch prefix check)
         if: env.PR_AUTHOR != env.BOT_ACCOUNT
+        id: decide
+        run: |
+          if [[ "${HEAD_REF}" == codereview/* ]]; then
+            echo "route=true" >> $GITHUB_OUTPUT
+          else
+            echo "route=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Skip — not a codereview/* branch (leave PR as-is)
+        if: env.PR_AUTHOR != env.BOT_ACCOUNT && steps.decide.outputs.route == 'false'
+        run: |
+          echo "Branch '${HEAD_REF}' does not start with 'codereview/'."
+          echo "Leaving PR open for normal engineer review. No Bugbot reauthoring."
+
+      # From here on, only run for codereview/* PRs authored by someone else.
+      - name: Debug - list existing PRs for head branch
+        if: env.PR_AUTHOR != env.BOT_ACCOUNT && steps.decide.outputs.route == 'true'
         run: |
           echo "Checking existing PRs for head=${OWNER}:${HEAD_REF}"
           resp=$(curl -sS \
@@ -80,7 +94,7 @@ jobs:
           echo "$resp" | jq 'if type=="array" then .[] | {number, state, head:.head.ref, base:.base.ref} else . end' || true
 
       - name: Close original PR (GITHUB_TOKEN)
-        if: env.PR_AUTHOR != env.BOT_ACCOUNT
+        if: env.PR_AUTHOR != env.BOT_ACCOUNT && steps.decide.outputs.route == 'true'
         run: |
           echo "Closing original PR #${PR_NUMBER} by ${PR_AUTHOR}"
           http=$(curl -sS -o /tmp/close.json -w "%{http_code}" \
@@ -97,7 +111,7 @@ jobs:
           fi
 
       - name: Create new PR as BOT_ACCOUNT (draft) via CR_PAT
-        if: env.PR_AUTHOR != env.BOT_ACCOUNT
+        if: env.PR_AUTHOR != env.BOT_ACCOUNT && steps.decide.outputs.route == 'true'
         run: |
           echo "Creating new PR as ${BOT_ACCOUNT}: head=${HEAD_REF} -> base=${BASE_REF}"
           http=$(curl -sS -o /tmp/create_pr.json -w "%{http_code}" \
@@ -121,7 +135,7 @@ jobs:
           echo "Created PR #$NEW_PR"
 
       - name: Trigger Bugbot on new PR (GITHUB_TOKEN)
-        if: env.PR_AUTHOR != env.BOT_ACCOUNT
+        if: env.PR_AUTHOR != env.BOT_ACCOUNT && steps.decide.outputs.route == 'true'
         run: |
           echo "Commenting 'bugbot run' on PR #${NEW_PR}"
           http=$(curl -sS -o /tmp/comment.json -w "%{http_code}" \
